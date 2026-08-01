@@ -12,15 +12,23 @@ import androidx.lifecycle.viewModelScope
 import com.example.BuildConfig
 import com.example.data.db.*
 import com.example.data.network.GeminiApiClient
+import com.example.data.network.SgaApiClient
 import com.example.data.repository.MoodleRepository
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 class MoodleViewModel(application: Application) : AndroidViewModel(application) {
     private val TAG = "MoodleViewModel"
+
+    private companion object {
+        // Renew the SGA access token when it expires within this window
+        const val SGA_REFRESH_LEEWAY_MILLIS = 5 * 60 * 1000L
+    }
 
     private val database = AppDatabase.getDatabase(application)
     private val repository = MoodleRepository(database.moodleDao())
@@ -88,6 +96,13 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
     private val _sgaPass = MutableStateFlow(sharedPrefs.getString("sga_pass", "") ?: "")
     val sgaPass: StateFlow<String> = _sgaPass.asStateFlow()
 
+    // SGA session validity, derived from the access token's JWT exp claim
+    private val _sgaSessionValid = MutableStateFlow(false)
+    val sgaSessionValid: StateFlow<Boolean> = _sgaSessionValid.asStateFlow()
+
+    private val _sgaExpiresAtMillis = MutableStateFlow(0L)
+    val sgaExpiresAtMillis: StateFlow<Long> = _sgaExpiresAtMillis.asStateFlow()
+
     // Sync State
     private val _isSyncing = MutableStateFlow(false)
     val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
@@ -147,6 +162,9 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         
         // Start background checks for notifications/alarms
         startAlarmChecker()
+
+        // Proactively renew the SGA session so the AI never hits an expired token
+        viewModelScope.launch { refreshSgaIfNeeded() }
     }
 
     // --- Actions ---
@@ -208,6 +226,8 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                     .putString("sga_pass", pass)
                     .apply()
 
+                updateSgaSessionMeta()
+
                 _isSyncing.value = false
                 val personaName = result.decodedPayload?.optJSONObject("persona")?.optString("nombres") ?: user
                 toastOnMain("Logged in to UNEMI SGA! Welcome, $personaName")
@@ -223,10 +243,103 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
     fun updateSgaTokens(newAccess: String, newRefresh: String) {
         _sgaAccessToken.value = newAccess
         _sgaRefreshToken.value = newRefresh
+
+        // A rotated token (career/period switch, refresh) carries the new session
+        // profile in its JWT payload — keep the stored payload in sync so the AI
+        // always sees the current career/period ids.
+        val newPayload = SgaApiClient.decodeJwtPayload(newAccess)?.toString()
+        if (newPayload != null && newPayload.isNotBlank()) {
+            _sgaSessionPayload.value = newPayload
+            sharedPrefs.edit()
+                .putString("sga_session_payload", newPayload)
+                .apply()
+        }
+
         sharedPrefs.edit()
             .putString("sga_access_token", newAccess)
             .putString("sga_refresh_token", newRefresh)
             .apply()
+        updateSgaSessionMeta()
+    }
+
+    /**
+     * Recomputes SGA session validity from the stored access token's exp claim.
+     */
+    private fun updateSgaSessionMeta() {
+        val token = _sgaAccessToken.value
+        if (token.isEmpty()) {
+            _sgaSessionValid.value = false
+            _sgaExpiresAtMillis.value = 0L
+            return
+        }
+        val exp = SgaApiClient.jwtExpiryMillis(token)
+        _sgaExpiresAtMillis.value = exp ?: 0L
+        // Tokens without a decodable exp claim are assumed valid
+        _sgaSessionValid.value = exp == null || exp > System.currentTimeMillis()
+    }
+
+    /**
+     * Ensures the stored SGA access token is valid, silently renewing it via the
+     * refresh token (or stored credentials as a fallback) when it is expired or
+     * about to expire. Returns true if a valid session is available afterwards.
+     */
+    suspend fun refreshSgaIfNeeded(force: Boolean = false): Boolean {
+        val token = _sgaAccessToken.value
+        if (token.isEmpty()) {
+            _sgaSessionValid.value = false
+            _sgaExpiresAtMillis.value = 0L
+            return false
+        }
+
+        val exp = SgaApiClient.jwtExpiryMillis(token)
+        if (!force && exp != null && exp - System.currentTimeMillis() > SGA_REFRESH_LEEWAY_MILLIS) {
+            _sgaSessionValid.value = true
+            _sgaExpiresAtMillis.value = exp
+            return true
+        }
+
+        // Step 1: refresh token
+        val curRefresh = _sgaRefreshToken.value
+        if (curRefresh.isNotEmpty()) {
+            try {
+                Log.i(TAG, "Proactively refreshing SGA session...")
+                val result = SgaApiClient.refreshToken(curRefresh)
+                updateSgaTokens(result.accessToken, result.refreshToken)
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "SGA proactive refresh failed: ${e.message}")
+            }
+        }
+
+        // Step 2: silent re-login with stored credentials
+        val curUser = _sgaUser.value
+        val curPass = _sgaPass.value
+        if (curUser.isNotEmpty() && curPass.isNotEmpty()) {
+            try {
+                Log.i(TAG, "Attempting silent SGA re-login for '$curUser'...")
+                val result = SgaApiClient.login(curUser, curPass)
+                _sgaSessionPayload.value = result.decodedPayload?.toString() ?: _sgaSessionPayload.value
+                updateSgaTokens(result.accessToken, result.refreshToken)
+                sharedPrefs.edit()
+                    .putString("sga_session_payload", _sgaSessionPayload.value)
+                    .apply()
+                return true
+            } catch (e: Exception) {
+                Log.e(TAG, "SGA proactive re-login failed: ${e.message}")
+            }
+        }
+
+        _sgaSessionValid.value = false
+        return false
+    }
+
+    /**
+     * Forces an immediate SGA session renewal (used by the UI Refresh button).
+     */
+    fun refreshSgaNow() {
+        viewModelScope.launch {
+            refreshSgaIfNeeded(force = true)
+        }
     }
 
     fun clearSgaSession() {
@@ -235,6 +348,8 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         _sgaSessionPayload.value = ""
         _sgaUser.value = ""
         _sgaPass.value = ""
+        _sgaSessionValid.value = false
+        _sgaExpiresAtMillis.value = 0L
         sharedPrefs.edit()
             .remove("sga_access_token")
             .remove("sga_refresh_token")
@@ -307,12 +422,19 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             _isChatLoading.value = true
             _chatProgressStatus.value = "Thinking..."
+
+            var streamedReply = false
             
             val activeAcc = activeAccount.value
             val activeAccId = activeAcc?.id ?: 0
             val curCourses = courses.value
             val curActivities = activities.value
             val curAlarms = notifications.value
+
+            // Ensure the SGA session is fresh before the AI queries university endpoints
+            if (sgaAccessToken.value.isNotEmpty()) {
+                refreshSgaIfNeeded()
+            }
  
             val chatResult = GeminiApiClient.chatWithAi(
                 userQuery = query,
@@ -330,19 +452,47 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                 sgaSessionPayload = sgaSessionPayload.value,
                 sgaUser = sgaUser.value,
                 sgaPass = sgaPass.value,
+                sgaSessionValid = sgaSessionValid.value,
                 chatHistory = chatMessages.dropLast(1),
                 onProgress = { status ->
                     _chatProgressStatus.value = status
+                },
+                onPartialReply = { partialText ->
+                    // Streamed text arrives from a background thread — hop to main before
+                    // touching Compose state.
+                    Handler(Looper.getMainLooper()).post {
+                        streamedReply = true
+                        if (chatMessages.isNotEmpty() && chatMessages.last().sender == "ai") {
+                            val idx = chatMessages.size - 1
+                            chatMessages[idx] = chatMessages[idx].copy(text = partialText)
+                        } else {
+                            chatMessages.add(
+                                ChatMessage(
+                                    sender = "ai",
+                                    text = partialText,
+                                    timestamp = System.currentTimeMillis()
+                                )
+                            )
+                        }
+                    }
                 },
                 onSgaTokenRefreshed = { newAccess, newRefresh ->
                     updateSgaTokens(newAccess, newRefresh)
                 }
             )
  
+            // Streamed text updates are posted to the main looper from background
+            // threads. Wait for any still-queued posts to be processed before
+            // finalizing the message, so streamedReply reflects every chunk.
+            suspendCancellableCoroutine<Unit> { cont ->
+                Handler(Looper.getMainLooper()).post {
+                    cont.resume(Unit)
+                }
+            }
+ 
             _isChatLoading.value = false
             
             var actionStatus: String? = null
-            
             // Execute actions returned by the AI
             chatResult.action?.let { action ->
                 when (action) {
@@ -401,36 +551,55 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
             }
  
             val replyText = chatResult.reply
-            val words = replyText.split(" ")
-            if (words.isEmpty() || replyText.trim().isEmpty()) {
-                chatMessages.add(
-                    ChatMessage(
+            if (streamedReply) {
+                // The final answer already streamed into the UI as it was generated;
+                // just set the authoritative full text and save.
+                if (chatMessages.isNotEmpty() && chatMessages.last().sender == "ai") {
+                    val idx = chatMessages.size - 1
+                    chatMessages[idx] = chatMessages[idx].copy(text = replyText, actionApplied = actionStatus)
+                } else {
+                    chatMessages.add(
+                        ChatMessage(
+                            sender = "ai",
+                            text = replyText,
+                            timestamp = System.currentTimeMillis(),
+                            actionApplied = actionStatus
+                        )
+                    )
+                }
+                saveChatHistory()
+            } else {
+                val words = replyText.split(" ")
+                if (words.isEmpty() || replyText.trim().isEmpty()) {
+                    chatMessages.add(
+                        ChatMessage(
+                            sender = "ai",
+                            text = replyText,
+                            timestamp = System.currentTimeMillis(),
+                            actionApplied = actionStatus
+                        )
+                    )
+                    saveChatHistory()
+                } else {
+                    val streamingMsg = ChatMessage(
                         sender = "ai",
-                        text = replyText,
+                        text = "",
                         timestamp = System.currentTimeMillis(),
                         actionApplied = actionStatus
                     )
-                )
-                saveChatHistory()
-            } else {
-                val streamingMsg = ChatMessage(
-                    sender = "ai",
-                    text = "",
-                    timestamp = System.currentTimeMillis(),
-                    actionApplied = actionStatus
-                )
-                chatMessages.add(streamingMsg)
-                val targetIndex = chatMessages.size - 1
- 
-                var currentText = ""
-                for (i in words.indices) {
-                    currentText += (if (i == 0) "" else " ") + words[i]
-                    if (targetIndex in chatMessages.indices) {
-                        chatMessages[targetIndex] = chatMessages[targetIndex].copy(text = currentText)
+                    chatMessages.add(streamingMsg)
+                    val targetIndex = chatMessages.size - 1
+     
+                    var currentText = ""
+                    for (i in words.indices) {
+                        currentText += (if (i == 0) "" else " ") + words[i]
+                        if (targetIndex in chatMessages.indices) {
+                            chatMessages[targetIndex] = chatMessages[targetIndex].copy(text = currentText)
+                        }
+                        delay(15)
                     }
-                    delay(15)
+                    saveChatHistory()
                 }
-                saveChatHistory()
             }
         }
     }

@@ -147,6 +147,25 @@ object SgaApiClient {
     }
 
     /**
+     * Returns the JWT `exp` claim (Unix seconds) converted to epoch millis,
+     * or null if the token cannot be decoded or has no exp claim.
+     */
+    fun jwtExpiryMillis(accessToken: String): Long? {
+        val payload = decodeJwtPayload(accessToken) ?: return null
+        val exp = payload.optLong("exp", -1L)
+        return if (exp > 0) exp * 1000L else null
+    }
+
+    /**
+     * True if the access token is expired or expires within leewayMillis.
+     * Returns false when the token cannot be decoded or has no exp claim.
+     */
+    fun isAccessTokenExpired(accessToken: String, leewayMillis: Long = 0L): Boolean {
+        val expMillis = jwtExpiryMillis(accessToken) ?: return false
+        return expMillis - System.currentTimeMillis() <= leewayMillis
+    }
+
+    /**
      * Helper to decode JWT payload without external libraries.
      */
     fun decodeJwtPayload(jwtToken: String): JSONObject? {

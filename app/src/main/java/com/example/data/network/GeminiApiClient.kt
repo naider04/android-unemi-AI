@@ -27,6 +27,9 @@ object GeminiApiClient {
     private const val TAG = "GeminiApiClient"
     private const val MODEL_NAME = "gemini-3.5-flash"
 
+    // Keep per-message history bounded so the prompt stays small and fast to process
+    private const val MAX_HISTORY_CHARS_PER_MSG = 1200
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(120, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
@@ -85,6 +88,110 @@ object GeminiApiClient {
     }
 
     /**
+     * Executes an OpenCode request with SSE streaming and assembles the assistant
+     * message (text and/or tool_calls) from the deltas.
+     * @param onPartialContent Invoked with the full text accumulated so far for the
+     *        current turn, as each chunk arrives. Only called while the turn has no
+     *        tool calls yet, so the user only ever sees the final answer text.
+     */
+    private suspend fun executeOpenCodeStream(
+        request: Request,
+        onProgress: ((String) -> Unit)? = null,
+        onPartialContent: ((String) -> Unit)? = null
+    ): JSONObject = withContext(Dispatchers.IO) {
+        var lastException: Exception? = null
+        val maxAttempts = 3
+        for (attempt in 1..maxAttempts) {
+            try {
+                if (attempt > 1) {
+                    onProgress?.invoke("Retrying OpenCode connection (attempt $attempt/$maxAttempts)...")
+                    delay(2000L * attempt)
+                }
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        val errBody = response.body?.string() ?: ""
+                        Log.e(TAG, "OpenCode API error (attempt $attempt): ${response.code} - $errBody")
+                        if (response.code in listOf(429, 500, 502, 503, 504) && attempt < maxAttempts) {
+                            lastException = IOException("Server status ${response.code}: $errBody")
+                            return@use
+                        }
+                        throw IOException("Server responded with code ${response.code}: $errBody")
+                    }
+
+                    val bodySource = response.body?.source() ?: throw IOException("Empty response from OpenCode")
+                    val contentBuf = StringBuilder()
+                    val toolCalls = JSONArray()
+                    var done = false
+
+                    while (!done) {
+                        val line = bodySource.readUtf8Line() ?: break
+                        if (line.isBlank()) continue
+                        if (!line.startsWith("data:")) continue
+                        val payload = line.removePrefix("data:").trim()
+                        if (payload == "[DONE]") break
+
+                        val chunk = try {
+                            JSONObject(payload)
+                        } catch (e: Exception) {
+                            continue
+                        }
+                        val choices = chunk.optJSONArray("choices")
+                        if (choices == null || choices.length() == 0) continue
+                        val choice = choices.getJSONObject(0)
+                        val delta = choice.optJSONObject("delta")
+
+                        if (delta != null) {
+                            if (delta.has("content") && !delta.isNull("content")) {
+                                contentBuf.append(delta.getString("content"))
+                                // Only surface text when this turn has no tool calls yet,
+                                // so intermediate turns never flash on screen.
+                                if (toolCalls.length() == 0) {
+                                    onPartialContent?.invoke(contentBuf.toString())
+                                }
+                            }
+                            val tcArray = delta.optJSONArray("tool_calls")
+                            if (tcArray != null) {
+                                for (i in 0 until tcArray.length()) {
+                                    val tc = tcArray.getJSONObject(i)
+                                    val index = tc.optInt("index", 0)
+                                    while (toolCalls.length() <= index) toolCalls.put(JSONObject())
+                                    val target = toolCalls.getJSONObject(index)
+                                    if (tc.has("id") && !tc.isNull("id")) target.put("id", tc.getString("id"))
+                                    if (tc.has("type") && !tc.isNull("type")) target.put("type", tc.getString("type"))
+                                    val fn = tc.optJSONObject("function")
+                                    if (fn != null) {
+                                        val tFn = if (target.has("function")) target.getJSONObject("function")
+                                        else JSONObject().also { target.put("function", it) }
+                                        if (fn.has("name") && !fn.isNull("name")) tFn.put("name", fn.getString("name"))
+                                        if (fn.has("arguments") && !fn.isNull("arguments")) {
+                                            tFn.put("arguments", tFn.optString("arguments", "") + fn.getString("arguments"))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (choice.has("finish_reason") && !choice.isNull("finish_reason")) {
+                            done = true
+                        }
+                    }
+
+                    return@withContext JSONObject().apply {
+                        put("role", "assistant")
+                        val contentStr = contentBuf.toString()
+                        if (contentStr.isNotEmpty()) put("content", contentStr)
+                        if (toolCalls.length() > 0) put("tool_calls", toolCalls)
+                    }
+                }
+            } catch (e: Exception) {
+                lastException = e
+                Log.w(TAG, "OpenCode stream attempt $attempt failed: ${e.message}")
+            }
+        }
+        throw lastException ?: IOException("Failed to connect to OpenCode after $maxAttempts attempts")
+    }
+
+    /**
      * Sends a request to Gemini 3.5 Flash with the student's database context.
      * @param userQuery The question/command from the user.
      * @param apiKey The Gemini API Key (either user provided or from BuildConfig).
@@ -109,8 +216,10 @@ object GeminiApiClient {
         sgaSessionPayload: String = "",
         sgaUser: String = "",
         sgaPass: String = "",
+        sgaSessionValid: Boolean = true,
         chatHistory: List<com.example.ui.viewmodel.ChatMessage> = emptyList(),
         onProgress: ((String) -> Unit)? = null,
+        onPartialReply: ((String) -> Unit)? = null,
         onSgaTokenRefreshed: ((newAccess: String, newRefresh: String) -> Unit)? = null
     ): ChatResult = withContext(Dispatchers.IO) {
         onProgress?.invoke("Thinking...")
@@ -209,9 +318,12 @@ object GeminiApiClient {
 
             ACTIVE UNEMI SGA SESSION:
             ${if (sgaAccessToken.isNotEmpty()) """
-            - SGA Session Status: Active
-            - DIRECT EXECUTION RULE: An active SGA session is configured. The app automatically injects and maintains the Authorization Bearer token and performs silent re-authentication on 401 errors. When calling UNEMI SGA endpoints using 'executeApiEndpoint', pass 'headersJson': '{}' or omit 'headersJson'. If an SGA API call still returns 401/Unauthorized after automatic refresh, inform the user: "Your SGA session expired and couldn't be renewed automatically — please re-authenticate in Configurations." Never invent, fabricate, or "confirm" SGA data unless explicitly returned by an actual API call.
+            - SGA Session Status: ${if (sgaSessionValid) "Active" else "Expired (renewal failed)"}
+            - DIRECT EXECUTION RULE: An active SGA session is configured${if (!sgaSessionValid) ", but it is currently expired and could not be renewed automatically" else ""}. The app automatically injects and maintains the Authorization Bearer token and performs silent re-authentication on 401 errors. When calling UNEMI SGA endpoints using 'executeApiEndpoint', pass 'headersJson': '{}' or omit 'headersJson'. If an SGA API call still returns 401/Unauthorized after automatic refresh, inform the user: "Your SGA session expired and couldn't be renewed automatically — please re-authenticate in Configurations." Never invent, fabricate, or "confirm" SGA data unless explicitly returned by an actual API call.
             """.trimIndent() else "No active UNEMI SGA session stored. If user asks for SGA info without logging in, tell them to log in via Configurations or supply credentials."}
+            
+            CURRENT SGA SESSION CONTEXT (REAL ids from the user's authenticated session — use these exact values for 'perfil_id' in token/change/career and 'periodo_id' in token/change/academic_period; NEVER invent, guess, or hardcode ids):
+            ${buildSgaSessionContext(sgaSessionPayload)}
             
             CRITICAL DIRECTIVE FOR UNEMI SGA API:
             - UNEMI SGA student endpoints are 100% STATELESS REST APIs located at 'https://sga.unemi.edu.ec/api/1.0/jwt/...'.
@@ -353,7 +465,7 @@ object GeminiApiClient {
                     recentHistory.forEach { msg ->
                         put(JSONObject().apply {
                             put("role", if (msg.sender == "user") "user" else "assistant")
-                            put("content", msg.text)
+                            put("content", msg.text.take(MAX_HISTORY_CHARS_PER_MSG))
                         })
                     }
                     put(JSONObject().apply {
@@ -415,6 +527,7 @@ object GeminiApiClient {
                         put("temperature", 0.3)
                         put("tools", openAiToolsArray)
                         put("thinking", JSONObject().apply { put("type", "disabled") })
+                        put("stream", true)
                     }
 
                     Log.d(TAG, "Sending request to OpenCode (loop ${openCodeLoopCount + 1}): model=$resolvedModel")
@@ -427,20 +540,19 @@ object GeminiApiClient {
                         .post(requestBody)
                         .build()
 
-                    val responseBodyStr = executeOpenCodeRequest(request, onProgress)
+                    // Stream the response: text deltas are forwarded to the UI as they
+                    // arrive (final answer only — tool-call turns have no visible text).
+                    val messageObj = executeOpenCodeStream(request, onProgress) { partialText ->
+                        onPartialReply?.invoke(partialText)
+                    }
+                    val toolCalls = messageObj.optJSONArray("tool_calls")
 
-                    val responseJson = JSONObject(responseBodyStr)
-                    val choices = responseJson.optJSONArray("choices")
-                    if (choices == null || choices.length() == 0) {
+                    if (messageObj.optString("content", "").isBlank() && (toolCalls == null || toolCalls.length() == 0)) {
                         return@withContext ChatResult(
                             reply = "No response candidates returned from OpenCode.",
                             action = null
                         )
                     }
-
-                    val choice = choices.getJSONObject(0)
-                    val messageObj = choice.optJSONObject("message") ?: JSONObject()
-                    val toolCalls = messageObj.optJSONArray("tool_calls")
 
                     // We MUST add the model's assistant turn to the messages history.
                     messagesArray.put(messageObj)
@@ -454,8 +566,13 @@ object GeminiApiClient {
                                     val callId = toolCall.getString("id")
                                     val functionObj = toolCall.getJSONObject("function")
                                     val name = functionObj.getString("name")
-                                    val argsStr = functionObj.getString("arguments")
-                                    val args = JSONObject(argsStr)
+                                    val argsStr = functionObj.optString("arguments", "{}")
+                                    val args = try {
+                                        JSONObject(argsStr)
+                                    } catch (e: Exception) {
+                                        Log.e(TAG, "Invalid tool call arguments: $argsStr", e)
+                                        JSONObject()
+                                    }
 
                                     Log.i(TAG, "OpenCode requested Function Call: $name (id: $callId) with args: $args")
 
@@ -838,7 +955,7 @@ object GeminiApiClient {
                 contentsArray.put(JSONObject().apply {
                     put("role", if (msg.sender == "user") "user" else "model")
                     put("parts", JSONArray().apply {
-                        put(JSONObject().apply { put("text", msg.text) })
+                        put(JSONObject().apply { put("text", msg.text.take(MAX_HISTORY_CHARS_PER_MSG)) })
                     })
                 })
             }
@@ -1124,6 +1241,46 @@ object GeminiApiClient {
         }
     }
 
+    /**
+     * Extracts the profile/period/matricula ids from the stored SGA JWT payload so
+     * the model always works with the CURRENT user's real ids (never hardcoded).
+     */
+    private fun buildSgaSessionContext(sgaSessionPayload: String): String {
+        if (sgaSessionPayload.isBlank()) {
+            return "(No SGA session payload stored — user must log in to SGA in Configurations before switching careers or periods.)"
+        }
+        return try {
+            val json = JSONObject(sgaSessionPayload)
+            val parts = mutableListOf<String>()
+            json.optJSONObject("perfilprincipal")?.let { parts.add("active_profile: ${it.toString()}") }
+            json.optJSONArray("perfiles")?.let { parts.add("all_profiles (use 'id' as perfil_id): ${it.toString()}") }
+            json.optJSONArray("periodos")?.let { parts.add("all_periods (use 'id' as periodo_id): ${it.toString()}") }
+            json.optJSONObject("periodo")?.let { parts.add("current_period: ${it.toString()}") }
+            json.optJSONObject("matricula")?.let { parts.add("matricula: ${it.toString()}") }
+            json.optJSONObject("inscripcion")?.let { parts.add("inscripcion: ${it.toString()}") }
+            if (parts.isEmpty()) sgaSessionPayload.take(2000) else parts.joinToString("\n")
+        } catch (e: Exception) {
+            sgaSessionPayload.take(2000)
+        }
+    }
+
+    /**
+     * SGA token-rotation endpoints (token/change/career, token/change/academic_period,
+     * token/refresh) return a fresh {access, refresh} pair in the response body.
+     * Returns it so the app keeps using the new session after e.g. a career switch.
+     */
+    private fun extractSgaRotatedTokens(url: String, body: String): Pair<String, String>? {
+        if (!url.contains("sga.unemi.edu.ec") || !url.contains("/token/")) return null
+        return try {
+            val json = JSONObject(body)
+            val access = json.optString("access", "")
+            val refresh = json.optString("refresh", "")
+            if (access.isNotEmpty() && refresh.isNotEmpty()) access to refresh else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun getFriendlyWsFunction(url: String): String {
         if (url.contains("sga.unemi.edu.ec") || url.contains("sgaestudiante.unemi.edu.ec")) {
             return when {
@@ -1213,6 +1370,13 @@ object GeminiApiClient {
                 val code = response.code
                 val body = response.body?.string() ?: ""
 
+                // SGA career/period/refresh endpoints rotate the JWT pair in the response
+                // body — capture the new tokens so subsequent calls use the new session.
+                extractSgaRotatedTokens(url, body)?.let { (newAccess, newRefresh) ->
+                    Log.i(TAG, "SGA session rotated by endpoint: $url — capturing new tokens")
+                    onSgaRefreshed?.invoke(newAccess, newRefresh)
+                }
+
                 val curRefreshToken = sgaRefreshTokenProvider()
                 val curUser = sgaUserProvider()
                 val curPass = sgaPassProvider()
@@ -1269,6 +1433,13 @@ object GeminiApiClient {
                         client.newCall(retryRequest).execute().use { retryResponse ->
                             val retryCode = retryResponse.code
                             val retryBody = retryResponse.body?.string() ?: ""
+
+                            // The retried endpoint may itself rotate the JWT pair (e.g. a
+                            // token/change call that 401'd) — capture it if present.
+                            extractSgaRotatedTokens(url, retryBody)?.let { (newAccess, newRefresh) ->
+                                onSgaRefreshed?.invoke(newAccess, newRefresh)
+                            }
+
                             val headersMap = retryResponse.headers.toMultimap()
                             val headersJsonObj = JSONObject()
                             headersMap.forEach { (k, v) ->

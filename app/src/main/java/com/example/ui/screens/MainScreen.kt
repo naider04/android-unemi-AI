@@ -2128,6 +2128,8 @@ fun SettingsDialog(
                     item {
                         val sgaToken by viewModel.sgaAccessToken.collectAsState()
                         val sgaPayload by viewModel.sgaSessionPayload.collectAsState()
+                        val sgaValid by viewModel.sgaSessionValid.collectAsState()
+                        val sgaExpiry by viewModel.sgaExpiresAtMillis.collectAsState()
                         var showSgaDialog by remember { mutableStateOf(false) }
 
                         Card(
@@ -2158,11 +2160,19 @@ fun SettingsDialog(
                                     }
 
                                     if (sgaToken.isNotEmpty()) {
-                                        OutlinedButton(
-                                            onClick = { viewModel.clearSgaSession() },
-                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
-                                        ) {
-                                            Text("Disconnect")
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            OutlinedButton(
+                                                onClick = { viewModel.refreshSgaNow() },
+                                                enabled = !sgaValid
+                                            ) {
+                                                Text(if (sgaValid) "Refresh" else "Reconnect")
+                                            }
+                                            OutlinedButton(
+                                                onClick = { viewModel.clearSgaSession() },
+                                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                                            ) {
+                                                Text("Disconnect")
+                                            }
                                         }
                                     } else {
                                         Button(onClick = { showSgaDialog = true }) {
@@ -2186,10 +2196,14 @@ fun SettingsDialog(
                                         }
                                     }
                                     Text(
-                                        text = "Status: Connected ($decodedUser)",
+                                        text = when {
+                                            !sgaValid -> "Status: Session Expired ($decodedUser)"
+                                            sgaExpiry > 0L -> "Status: Connected ($decodedUser) — expires ${formatSgaExpiry(sgaExpiry)}"
+                                            else -> "Status: Connected ($decodedUser)"
+                                        },
                                         style = MaterialTheme.typography.bodyMedium,
                                         fontWeight = FontWeight.SemiBold,
-                                        color = MaterialTheme.colorScheme.primary
+                                        color = if (sgaValid) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                                     )
                                     Text(
                                         text = "The AI companion can query grades, malla, exams, schedule, finances, and events credential-free via JWT token.",
@@ -2320,6 +2334,15 @@ fun AddAccountDialog(viewModel: MoodleViewModel, onDismiss: () -> Unit) {
             }
         }
     )
+}
+
+private fun formatSgaExpiry(epochMillis: Long): String {
+    return try {
+        java.text.SimpleDateFormat("MMM dd, HH:mm", java.util.Locale.getDefault())
+            .format(java.util.Date(epochMillis))
+    } catch (e: Exception) {
+        ""
+    }
 }
 
 @Composable
