@@ -1291,6 +1291,212 @@ object GeminiApiClient {
         }
     }
 
+    /**
+     * SGA data endpoints return very large payloads (materias/notas/malla are
+     * 300-400 KB) that exceed the tool-result truncation limit, so the model
+     * only ever saw the first subject. This converts them into a compact digest
+     * of the fields the AI needs (notas, asistencia, estado, docentes...).
+     * Returns null when the URL is not a known SGA data endpoint or the body
+     * cannot be parsed, so callers fall back to the raw (truncated) payload.
+     */
+    private fun summarizeSgaResponse(url: String, body: String): String? {
+        if (!url.contains("sga.unemi.edu.ec")) return null
+        val json = try {
+            JSONObject(body)
+        } catch (e: Exception) {
+            return null
+        }
+        val data = json.optJSONObject("data") ?: return null
+        val sb = StringBuilder()
+        when {
+            url.contains("alumno/materias") -> summarizeMaterias(data, sb)
+            url.contains("alumno/notas") -> summarizeNotas(data, sb)
+            url.contains("alumno/malla") -> summarizeMalla(data, sb)
+            url.contains("alumno/horarioexamen") -> summarizeHorarioExamen(data, sb)
+            url.contains("alumno/finanzas") -> summarizeFinanzas(data, sb)
+            url.contains("alumno/evento") -> summarizeEventos(data, sb)
+            else -> return null
+        }
+        return if (sb.isNotEmpty()) sb.toString() else null
+    }
+
+    private fun summarizeMaterias(data: JSONObject, sb: StringBuilder) {
+        val periodo = data.optJSONObject("ePeriodo")?.optString("nombre", "").orEmpty()
+        if (periodo.isNotEmpty()) sb.append("PERIODO: $periodo\n\n")
+        val arr = data.optJSONArray("eMateriasAsignadas") ?: return
+        sb.append("MATERIAS ACTUALES (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val m = arr.optJSONObject(i) ?: continue
+            val materia = m.optJSONObject("materia") ?: JSONObject()
+            val asignatura = materia.optJSONObject("asignatura") ?: JSONObject()
+            val nombre = asignatura.optString("nombre")
+                .ifEmpty { materia.optString("display") }
+                .ifEmpty { m.optString("display") }
+            val nivel = materia.optJSONObject("asignaturamalla")
+                ?.optJSONObject("nivelmalla")?.optString("nombre", "")
+            val paralelo = materia.optString("paralelo", "")
+            val docente = materia.optJSONObject("profesor")?.optString("display", "").orEmpty()
+            val estado = m.optJSONObject("estado")?.optString("display", "").orEmpty()
+            val nota = m.optString("notafinal", "")
+            val asis = m.optString("asistenciafinal", "")
+            val asisDet = "${m.optString("total_asistencias", "")}/${m.optString("total_faltas", "")}"
+
+            sb.append("${i + 1}. $nombre")
+            if (!nivel.isNullOrEmpty()) sb.append(" [$nivel]")
+            if (paralelo.isNotEmpty()) sb.append(" ($paralelo)")
+            if (docente.isNotEmpty()) sb.append(" - $docente")
+            sb.append("\n   Estado: ${estado.ifEmpty { "?" }}")
+            if (nota.isNotEmpty()) sb.append(" | Nota final: $nota")
+            if (asis.isNotEmpty()) sb.append(" | Asistencia: $asis% ($asisDet clases)")
+
+            val evals = m.optJSONArray("evaluaciong")
+            if (evals != null && evals.length() > 0) {
+                val parts = mutableListOf<String>()
+                val sortedEvals = (0 until evals.length()).mapNotNull { evals.optJSONObject(it) }
+                    .sortedBy { it.optJSONObject("detallemodeloevaluativo")?.optInt("orden", Int.MAX_VALUE) ?: Int.MAX_VALUE }
+                for (ev in sortedEvals) {
+                    val dme = ev.optJSONObject("detallemodeloevaluativo") ?: continue
+                    val name = dme.optString("nombre", "")
+                    if (name.isEmpty()) continue
+                    parts.add("$name=${ev.optString("valor", "")}")
+                }
+                if (parts.isNotEmpty()) sb.append("\n   Notas: ${parts.joinToString(" ")}")
+            }
+            sb.append("\n")
+        }
+    }
+
+    private fun summarizeNotas(data: JSONObject, sb: StringBuilder) {
+        val arr = data.optJSONArray("eRecordaAademicos") ?: return
+        var aprobadas = 0
+        var reprobadas = 0
+        var pendientes = 0
+        sb.append("REGISTRO ACADÉMICO (${arr.length()} materias):\n")
+        for (i in 0 until arr.length()) {
+            val r = arr.optJSONObject(i) ?: continue
+            val am = r.optJSONObject("asignaturamalla") ?: JSONObject()
+            val nombre = am.optJSONObject("asignatura")?.optString("nombre")
+                ?: r.optJSONObject("asignatura")?.optString("nombre")
+                ?: r.optString("display", "").substringBefore("  [Nota:").trim()
+            val nivel = am.optJSONObject("nivelmalla")?.optString("nombre", "")
+            val nota = r.optString("nota", "")
+            val asis = r.optString("asistencia", "")
+            val aprobada = r.optBoolean("aprobada", false)
+            val homologada = r.optBoolean("homologada", false)
+            val convalidada = r.optBoolean("convalidacion", false)
+            val pendiente = r.optBoolean("pendiente", false)
+            val creditos = r.optString("creditos", "")
+
+            val flags = mutableListOf<String>()
+            if (aprobada) flags.add("APROBADA") else flags.add("REPROBADA")
+            if (homologada) flags.add("homologada")
+            if (convalidada) flags.add("convalidada")
+            if (pendiente) flags.add("pendiente")
+
+            when {
+                aprobada -> aprobadas++
+                pendiente -> pendientes++
+                else -> reprobadas++
+            }
+
+            sb.append("- $nombre")
+            if (!nivel.isNullOrEmpty()) sb.append(" [$nivel]")
+            if (nota.isNotEmpty()) sb.append(": Nota $nota")
+            if (asis.isNotEmpty()) sb.append(" (Asist. $asis%)")
+            if (creditos.isNotEmpty()) sb.append(" | ${creditos} créditos")
+            sb.append(" | ${flags.joinToString(", ")}")
+            sb.append("\n")
+        }
+        sb.append("\nResumen: $aprobadas aprobadas, $reprobadas reprobadas, $pendientes pendientes")
+    }
+
+    private fun summarizeMalla(data: JSONObject, sb: StringBuilder) {
+        val malla = data.optJSONObject("eMalla")
+        val mallaDisplay = malla?.optString("display", "").orEmpty()
+        if (mallaDisplay.isNotEmpty()) sb.append("MALLA: $mallaDisplay\n")
+        val arr = data.optJSONArray("eAsignaturasMalla") ?: return
+        var totalCreditos = 0.0
+        sb.append("MATERIAS DE LA MALLA (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val a = arr.optJSONObject(i) ?: continue
+            val nombre = a.optJSONObject("asignatura")?.optString("nombre")
+                ?: a.optString("display", "")
+            val nivel = a.optJSONObject("nivelmalla")?.optString("nombre", "").orEmpty()
+            val eje = a.optJSONObject("ejeformativo")?.optString("display", "").orEmpty()
+            val creditos = a.optDouble("creditos", 0.0)
+            val horas = a.optString("horas", "")
+            totalCreditos += creditos
+            sb.append("- $nombre")
+            if (nivel.isNotEmpty()) sb.append(" [$nivel]")
+            if (eje.isNotEmpty()) sb.append(" ($eje)")
+            sb.append(" | ${creditos} créditos")
+            if (horas.isNotEmpty()) sb.append(", $horas horas")
+            sb.append("\n")
+        }
+        sb.append("\nTotal créditos de la malla: $totalCreditos")
+    }
+
+    private fun summarizeHorarioExamen(data: JSONObject, sb: StringBuilder) {
+        val arr = data.optJSONArray("aAsignaciones") ?: return
+        sb.append("HORARIO DE EXÁMENES (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val a = arr.optJSONObject(i) ?: continue
+            val materia = a.optJSONObject("materia") ?: JSONObject()
+            val nombre = materia.optString("materia", "")
+                .ifEmpty { materia.optString("display", "") }
+            val nivel = materia.optString("nivel", "")
+            val paralelo = materia.optString("paralelo", "")
+            val aula = materia.optString("aula", "")
+            val sede = materia.optString("sede", "")
+            sb.append("- $nombre")
+            if (nivel.isNotEmpty()) sb.append(" [$nivel]")
+            if (paralelo.isNotEmpty()) sb.append(" ($paralelo)")
+            sb.append(" | ${a.optString("fecha", "")} ${a.optString("horainicio", "")}")
+            if (aula.isNotEmpty()) sb.append(" | Aula: $aula")
+            if (sede.isNotEmpty()) sb.append(" ($sede)")
+            sb.append("\n")
+        }
+    }
+
+    private fun summarizeFinanzas(data: JSONObject, sb: StringBuilder) {
+        val periodo = data.optJSONObject("ePeriodoMatricula")?.optString("display", "").orEmpty()
+        if (periodo.isNotEmpty()) sb.append("PERIODO: $periodo\n")
+        val arr = data.optJSONArray("eRubros") ?: return
+        sb.append("RUBROS (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val r = arr.optJSONObject(i) ?: continue
+            val nombre = r.optString("nombre", "").ifEmpty { r.optString("display", "") }
+            sb.append("- $nombre")
+            if (r.optBoolean("esta_liquidado", false)) {
+                sb.append(" | PAGADO")
+            } else {
+                val adeudado = r.optString("adeudado", "")
+                val totalPagado = r.optString("total_pagado", "")
+                val saldo = r.optString("saldo", "")
+                sb.append(" | adeudado: $adeudado, pagado: $totalPagado, saldo: $saldo")
+                val fecha = r.optString("fecha_cobro_natural", "")
+                if (fecha.isNotEmpty()) sb.append(", vence: $fecha")
+            }
+            sb.append("\n")
+        }
+    }
+
+    private fun summarizeEventos(data: JSONObject, sb: StringBuilder) {
+        val arr = data.optJSONArray("eEventos") ?: return
+        sb.append("EVENTOS (${arr.length()}):\n")
+        for (i in 0 until arr.length()) {
+            val e = arr.optJSONObject(i) ?: continue
+            val nombre = e.optJSONObject("evento")?.optString("nombre")
+                ?: e.optString("display", "")
+            val tipo = e.optJSONObject("tipo")?.optString("nombre", "").orEmpty()
+            sb.append("- $nombre")
+            if (tipo.isNotEmpty()) sb.append(" ($tipo)")
+            sb.append(" | ${e.optString("fechainicio", "")} → ${e.optString("fechafin", "")}")
+            if (e.optBoolean("inscrito", false)) sb.append(" | INSCRITO")
+            sb.append("\n")
+        }
+    }
+
     private fun getFriendlyWsFunction(url: String): String {
         if (url.contains("sga.unemi.edu.ec") || url.contains("sgaestudiante.unemi.edu.ec")) {
             return when {
@@ -1488,7 +1694,7 @@ object GeminiApiClient {
                                     put("status", retryCode)
                                     put("isSuccessful", retryResponse.isSuccessful)
                                     put("headers", headersJsonObj)
-                                    put("body", retryBody)
+                                    put("body", summarizeSgaResponse(url, retryBody) ?: retryBody)
                                     put("autoRefreshedToken", true)
                                 }.toString()
                             }
@@ -1510,7 +1716,7 @@ object GeminiApiClient {
                     put("status", code)
                     put("isSuccessful", response.isSuccessful)
                     put("headers", headersJsonObj)
-                    put("body", body)
+                    put("body", summarizeSgaResponse(url, body) ?: body)
                 }.toString()
             }
         } catch (e: Exception) {
