@@ -209,10 +209,8 @@ object GeminiApiClient {
 
             ACTIVE UNEMI SGA SESSION:
             ${if (sgaAccessToken.isNotEmpty()) """
-            - SGA Access Token: $sgaAccessToken
-            - SGA Refresh Token: $sgaRefreshToken
-            - SGA Session Metadata: $sgaSessionPayload
-            - DIRECT CREDENTIAL-FREE EXECUTION RULE: You ALREADY HAVE an active SGA session! NEVER claim credentials or tokens are missing/expired or ask for passwords. When calling any UNEMI SGA endpoint using 'executeApiEndpoint', you can pass 'headersJson': '{}' or omit 'headersJson' — the app automatically injects and maintains the active Authorization Bearer token and handles token rotation automatically.
+            - SGA Session Status: Active
+            - DIRECT EXECUTION RULE: An active SGA session is configured. The app automatically injects and maintains the Authorization Bearer token and performs silent re-authentication on 401 errors. When calling UNEMI SGA endpoints using 'executeApiEndpoint', pass 'headersJson': '{}' or omit 'headersJson'. If an SGA API call still returns 401/Unauthorized after automatic refresh, inform the user: "Your SGA session expired and couldn't be renewed automatically — please re-authenticate in Configurations." Never invent, fabricate, or "confirm" SGA data unless explicitly returned by an actual API call.
             """.trimIndent() else "No active UNEMI SGA session stored. If user asks for SGA info without logging in, tell them to log in via Configurations or supply credentials."}
             
             CRITICAL DIRECTIVE FOR UNEMI SGA API:
