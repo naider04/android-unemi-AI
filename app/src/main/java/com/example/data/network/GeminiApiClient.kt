@@ -377,8 +377,9 @@ object GeminiApiClient {
             - GET https://sga.unemi.edu.ec/api/1.0/jwt/alumno/notificacion (Student notifications list)
             - GET https://sga.unemi.edu.ec/api/1.0/jwt/alumno/evento?opc_select=2 (Upcoming university events)
             - GET/POST https://sga.unemi.edu.ec/api/1.0/jwt/alumno/tutoria_academica (Academic tutoring requests: action "loadSolicitudes" or "loadMaterias")
-            - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/academic_period (Switch academic period: body {"refresh":"...", "periodo_id":<id>})
-            - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/career (Switch career: body {"refresh":"...", "perfil_id":<id>})
+            - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/academic_period (Switch academic period: body {"periodo_id":<id from CURRENT SGA SESSION CONTEXT>} — the app auto-injects the "refresh" token, never include it)
+            - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/career (Switch career: body {"perfil_id":<id from CURRENT SGA SESSION CONTEXT>} — the app auto-injects the "refresh" token, never include it)
+            When the user asks about a different career or period than the currently active one, IMMEDIATELY switch via token/change first, then query the data endpoint — the new session is automatically kept for subsequent calls.
             Note for SGA Endpoints: Pass 'headersJson': '{"Authorization": "Bearer <access_token>"}' when calling JWT endpoints.
 
             GRADE & STATUS EXTRACTION RULES:
@@ -889,8 +890,9 @@ object GeminiApiClient {
                 - GET https://sga.unemi.edu.ec/api/1.0/jwt/alumno/notificacion (Student notifications list)
                 - GET https://sga.unemi.edu.ec/api/1.0/jwt/alumno/evento?opc_select=2 (Upcoming university events)
                 - GET/POST https://sga.unemi.edu.ec/api/1.0/jwt/alumno/tutoria_academica (Academic tutoring requests: action "loadSolicitudes" or "loadMaterias")
-                - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/academic_period (Switch academic period: body {"refresh":"...", "periodo_id":<id>})
-                - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/career (Switch career: body {"refresh":"...", "perfil_id":<id>})
+                - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/academic_period (Switch academic period: body {"periodo_id":<id from CURRENT SGA SESSION CONTEXT>} — the app auto-injects the "refresh" token, never include it)
+                - POST https://sga.unemi.edu.ec/api/1.0/jwt/token/change/career (Switch career: body {"perfil_id":<id from CURRENT SGA SESSION CONTEXT>} — the app auto-injects the "refresh" token, never include it)
+                When the user asks about a different career or period than the currently active one, IMMEDIATELY switch via token/change first, then query the data endpoint — the new session is automatically kept for subsequent calls.
                 CRITICAL: SGA student endpoints are 100% STATELESS REST APIs. DO NOT claim that SGA requires WebSockets, cookies, a WebView, or browser activation. Pass 'headersJson': '{"Authorization": "Bearer <access_token>"}' when calling JWT endpoints.
 
                 GRADE & STATUS EXTRACTION RULES:
@@ -1563,19 +1565,37 @@ object GeminiApiClient {
             }
 
             val mediaType = "application/json; charset=utf-8".toMediaType()
+
+            // token/change/* (career or period switch) requires the single-use
+            // refresh token in the request body. The model only knows the target
+            // perfil_id/periodo_id from the session context — inject the real
+            // refresh token here so it never has to see or guess it.
+            var effectiveBodyJson = bodyJson
+            if (url.contains("/token/change/") && method.equals("POST", ignoreCase = true)) {
+                effectiveBodyJson = try {
+                    val bodyObj = if (bodyJson.isNotBlank()) JSONObject(bodyJson) else JSONObject()
+                    if (bodyObj.optString("refresh", "").isEmpty()) {
+                        bodyObj.put("refresh", sgaRefreshTokenProvider())
+                    }
+                    bodyObj.toString()
+                } catch (e: Exception) {
+                    bodyJson
+                }
+            }
+
             val request = when (method.uppercase()) {
                 "GET" -> builder.get().build()
                 "POST" -> {
-                    val requestBody = bodyJson.toRequestBody(mediaType)
+                    val requestBody = effectiveBodyJson.toRequestBody(mediaType)
                     builder.post(requestBody).build()
                 }
                 "PUT" -> {
-                    val requestBody = bodyJson.toRequestBody(mediaType)
+                    val requestBody = effectiveBodyJson.toRequestBody(mediaType)
                     builder.put(requestBody).build()
                 }
                 "DELETE" -> {
-                    if (bodyJson.isNotEmpty()) {
-                        builder.delete(bodyJson.toRequestBody(mediaType)).build()
+                    if (effectiveBodyJson.isNotEmpty()) {
+                        builder.delete(effectiveBodyJson.toRequestBody(mediaType)).build()
                     } else {
                         builder.delete().build()
                     }
@@ -1668,9 +1688,9 @@ object GeminiApiClient {
                             }
 
                             val retryRequest = when (method.uppercase()) {
-                                "POST" -> retryBuilder.post(bodyJson.toRequestBody(mediaType)).build()
-                                "PUT" -> retryBuilder.put(bodyJson.toRequestBody(mediaType)).build()
-                                "DELETE" -> if (bodyJson.isNotEmpty()) retryBuilder.delete(bodyJson.toRequestBody(mediaType)).build() else retryBuilder.delete().build()
+                                "POST" -> retryBuilder.post(effectiveBodyJson.toRequestBody(mediaType)).build()
+                                "PUT" -> retryBuilder.put(effectiveBodyJson.toRequestBody(mediaType)).build()
+                                "DELETE" -> if (effectiveBodyJson.isNotEmpty()) retryBuilder.delete(effectiveBodyJson.toRequestBody(mediaType)).build() else retryBuilder.delete().build()
                                 else -> retryBuilder.get().build()
                             }
 

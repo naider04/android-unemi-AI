@@ -2110,11 +2110,6 @@ fun SettingsDialog(
                                         Text("User: ${account.username}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                     Row {
-                                        if (!isActive) {
-                                            IconButton(onClick = { viewModel.switchAccount(account.id) }) {
-                                                Icon(Icons.Default.SwapHoriz, contentDescription = "Switch to Account")
-                                            }
-                                        }
                                         IconButton(onClick = { viewModel.deleteAccount(account.id) }) {
                                             Icon(Icons.Default.Delete, contentDescription = "Delete Account", tint = MaterialTheme.colorScheme.error)
                                         }
