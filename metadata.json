@@ -1,0 +1,6 @@
+{
+  "name": "Moodle AI Companion",
+  "description": "An AI-powered assistant that logs into Moodle to analyze grades, courses, activities, manage notes, and code custom notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

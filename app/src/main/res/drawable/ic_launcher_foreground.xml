@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Glowing Synapses / Neural Networks (Moodle AI Theme) -->
+    <!-- Magenta Synapse -->
+    <path
+        android:fillColor="#FF4081"
+        android:pathData="M38,68 A3,3 0 1,1 32,68 A3,3 0 1,1 38,68 Z" />
+    <!-- Cyan Synapse -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M76,68 A3,3 0 1,1 70,68 A3,3 0 1,1 76,68 Z" />
+    <!-- Yellow Synapse -->
+    <path
+        android:fillColor="#FFD600"
+        android:pathData="M57,80 A3,3 0 1,1 51,80 A3,3 0 1,1 57,80 Z" />
+
+    <!-- Neural Connecting Circuit Lines -->
+    <path
+        android:strokeColor="#1F2438"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M35,68 L54,64 L73,68 L54,80 Z" />
+
+    <!-- Graduation Cap Top (Diamond Plate) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,28 L86,40 L54,52 L22,40 Z" />
+
+    <!-- Graduation Cap Cap Base -->
+    <path
+        android:fillColor="#D1D5DB"
+        android:pathData="M38,46 L38,54 C38,60 70,60 70,54 L70,46 Z" />
+
+    <!-- Tassel String and Hanging Plaque -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.0"
+        android:strokeLineCap="round"
+        android:pathData="M54,40 L28,48 L26,58" />
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M24,58 L28,58 L28,62 L24,62 Z" />
+
+</vector>
