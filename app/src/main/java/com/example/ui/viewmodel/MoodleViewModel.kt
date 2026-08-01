@@ -285,33 +285,31 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
      */
     suspend fun refreshSgaIfNeeded(force: Boolean = false): Boolean {
         val token = _sgaAccessToken.value
-        if (token.isEmpty()) {
-            _sgaSessionValid.value = false
-            _sgaExpiresAtMillis.value = 0L
-            return false
-        }
 
-        val exp = SgaApiClient.jwtExpiryMillis(token)
-        if (!force && exp != null && exp - System.currentTimeMillis() > SGA_REFRESH_LEEWAY_MILLIS) {
-            _sgaSessionValid.value = true
-            _sgaExpiresAtMillis.value = exp
-            return true
-        }
-
-        // Step 1: refresh token
-        val curRefresh = _sgaRefreshToken.value
-        if (curRefresh.isNotEmpty()) {
-            try {
-                Log.i(TAG, "Proactively refreshing SGA session...")
-                val result = SgaApiClient.refreshToken(curRefresh)
-                updateSgaTokens(result.accessToken, result.refreshToken)
+        if (token.isNotEmpty()) {
+            val exp = SgaApiClient.jwtExpiryMillis(token)
+            if (!force && exp != null && exp - System.currentTimeMillis() > SGA_REFRESH_LEEWAY_MILLIS) {
+                _sgaSessionValid.value = true
+                _sgaExpiresAtMillis.value = exp
                 return true
-            } catch (e: Exception) {
-                Log.e(TAG, "SGA proactive refresh failed: ${e.message}")
+            }
+
+            // Step 1: refresh token
+            val curRefresh = _sgaRefreshToken.value
+            if (curRefresh.isNotEmpty()) {
+                try {
+                    Log.i(TAG, "Proactively refreshing SGA session...")
+                    val result = SgaApiClient.refreshToken(curRefresh)
+                    updateSgaTokens(result.accessToken, result.refreshToken)
+                    return true
+                } catch (e: Exception) {
+                    Log.e(TAG, "SGA proactive refresh failed: ${e.message}")
+                }
             }
         }
 
-        // Step 2: silent re-login with stored credentials
+        // Step 2: silent re-login with stored credentials (also covers the case
+        // where no access token is stored at all but credentials exist).
         val curUser = _sgaUser.value
         val curPass = _sgaPass.value
         if (curUser.isNotEmpty() && curPass.isNotEmpty()) {
@@ -330,15 +328,31 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         }
 
         _sgaSessionValid.value = false
+        if (token.isEmpty()) {
+            _sgaExpiresAtMillis.value = 0L
+        }
         return false
     }
 
     /**
      * Forces an immediate SGA session renewal (used by the UI Refresh button).
+     * Shows a toast with the outcome; when no stored credentials exist, the
+     * caller is told to open the credential dialog so the user can reconnect.
      */
-    fun refreshSgaNow() {
+    fun refreshSgaNow(onNeedsCredentials: () -> Unit = {}) {
         viewModelScope.launch {
-            refreshSgaIfNeeded(force = true)
+            val ok = refreshSgaIfNeeded(force = true)
+            if (ok) {
+                toastOnMain("SGA session renewed successfully")
+            } else {
+                val hasCreds = _sgaUser.value.isNotEmpty() && _sgaPass.value.isNotEmpty()
+                if (hasCreds) {
+                    toastOnMain("SGA reconnection failed — please check your credentials")
+                } else {
+                    toastOnMain("SGA session expired — please re-enter your credentials to reconnect")
+                    onNeedsCredentials()
+                }
+            }
         }
     }
 

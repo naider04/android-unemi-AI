@@ -13,6 +13,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -36,6 +38,12 @@ object GeminiApiClient {
         .writeTimeout(120, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
+
+    // SGA refresh tokens are single-use (rotated on every refresh). Parallel tool
+    // calls can 401 simultaneously and would each try to refresh with the same
+    // token, invalidating each other. This mutex makes exactly one coroutine do
+    // the refresh and everyone else wait for it, then retry with the fresh token.
+    private val sgaRefreshMutex = Mutex()
 
     private val userIdCache = ConcurrentHashMap<String, Int>()
 
@@ -604,6 +612,7 @@ object GeminiApiClient {
                                             method = requestMethod,
                                             headersJson = requestHeaders,
                                             bodyJson = requestBodyStr,
+                                            sgaAccessTokenProvider = { currentSgaAccessToken },
                                             sgaRefreshTokenProvider = { currentSgaRefreshToken },
                                             sgaUserProvider = { sgaUser },
                                             sgaPassProvider = { sgaPass },
@@ -1120,6 +1129,7 @@ object GeminiApiClient {
                             method = requestMethod,
                             headersJson = requestHeaders,
                             bodyJson = requestBodyStr,
+                            sgaAccessTokenProvider = { currentSgaAccessToken },
                             sgaRefreshTokenProvider = { currentSgaRefreshToken },
                             sgaUserProvider = { sgaUser },
                             sgaPassProvider = { sgaPass },
@@ -1324,6 +1334,7 @@ object GeminiApiClient {
         method: String,
         headersJson: String,
         bodyJson: String,
+        sgaAccessTokenProvider: () -> String = { "" },
         sgaRefreshTokenProvider: () -> String = { "" },
         sgaUserProvider: () -> String = { "" },
         sgaPassProvider: () -> String = { "" },
@@ -1383,77 +1394,109 @@ object GeminiApiClient {
 
                 // Handle SGA token expiration (401/403) by attempting automatic token refresh & silent re-login fallback
                 if ((code == 401 || code == 403) && url.contains("sga.unemi.edu.ec")) {
-                    var newAccess = ""
-                    var newRefresh = ""
-
-                    // Step 1: Attempt Refresh Token
-                    if (curRefreshToken.isNotEmpty()) {
-                        try {
-                            Log.i(TAG, "SGA endpoint returned $code. Attempting automatic token refresh...")
-                            val newAuth = SgaApiClient.refreshToken(curRefreshToken)
-                            newAccess = newAuth.accessToken
-                            newRefresh = newAuth.refreshToken
-                        } catch (e: Exception) {
-                            Log.e(TAG, "SGA Auto-refresh failed: ${e.message}. Trying silent re-login...")
-                        }
+                    // The Authorization token that was actually sent with this request.
+                    // Compared against the current token inside the lock to detect that
+                    // a concurrent tool call already renewed the session.
+                    val sentAccessToken = try {
+                        if (headersJson.isNotBlank()) {
+                            JSONObject(headersJson).optString("Authorization", "")
+                                .removePrefix("Bearer ").trim()
+                        } else ""
+                    } catch (e: Exception) {
+                        ""
                     }
 
-                    // Step 2: If Refresh Token failed or was invalid, attempt silent re-login with stored credentials
-                    if (newAccess.isEmpty() && curUser.isNotEmpty() && curPass.isNotEmpty()) {
-                        try {
-                            Log.i(TAG, "Attempting silent SGA re-login for user '$curUser'...")
-                            val newAuth = SgaApiClient.login(curUser, curPass)
-                            newAccess = newAuth.accessToken
-                            newRefresh = newAuth.refreshToken
-                        } catch (e: Exception) {
-                            Log.e(TAG, "SGA Silent re-login failed: ${e.message}")
-                        }
-                    }
+                    var autoRetryResult: String? = null
+                    sgaRefreshMutex.withLock {
+                        val currentAccess = sgaAccessTokenProvider()
+                        val alreadyRefreshed = currentAccess.isNotEmpty() && currentAccess != sentAccessToken
 
-                    if (newAccess.isNotEmpty()) {
-                        onSgaRefreshed?.invoke(newAccess, newRefresh)
+                        if (alreadyRefreshed) {
+                            // A parallel tool call hit the 401 first and renewed the
+                            // session while we were waiting — just retry with the fresh token.
+                            Log.i(TAG, "SGA session already renewed by a concurrent request — retrying with fresh token")
+                        } else {
+                            // Step 1: Attempt Refresh Token
+                            var newAccess = ""
+                            var newRefresh = ""
+                            if (curRefreshToken.isNotEmpty()) {
+                                try {
+                                    Log.i(TAG, "SGA endpoint returned $code. Attempting automatic token refresh...")
+                                    val newAuth = SgaApiClient.refreshToken(curRefreshToken)
+                                    newAccess = newAuth.accessToken
+                                    newRefresh = newAuth.refreshToken
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "SGA Auto-refresh failed: ${e.message}. Trying silent re-login...")
+                                }
+                            }
 
-                        val newHeadersObj = if (headersJson.isNotBlank()) JSONObject(headersJson) else JSONObject()
-                        newHeadersObj.put("Authorization", "Bearer $newAccess")
+                            // Step 2: If Refresh Token failed or was invalid, attempt silent re-login with stored credentials
+                            if (newAccess.isEmpty() && curUser.isNotEmpty() && curPass.isNotEmpty()) {
+                                try {
+                                    Log.i(TAG, "Attempting silent SGA re-login for user '$curUser'...")
+                                    val newAuth = SgaApiClient.login(curUser, curPass)
+                                    newAccess = newAuth.accessToken
+                                    newRefresh = newAuth.refreshToken
+                                } catch (e: Exception) {
+                                    Log.e(TAG, "SGA Silent re-login failed: ${e.message}")
+                                }
+                            }
 
-                        val retryBuilder = Request.Builder().url(url)
-                        val keys = newHeadersObj.keys()
-                        while (keys.hasNext()) {
-                            val k = keys.next()
-                            retryBuilder.addHeader(k, newHeadersObj.getString(k))
-                        }
-
-                        val retryRequest = when (method.uppercase()) {
-                            "POST" -> retryBuilder.post(bodyJson.toRequestBody(mediaType)).build()
-                            "PUT" -> retryBuilder.put(bodyJson.toRequestBody(mediaType)).build()
-                            "DELETE" -> if (bodyJson.isNotEmpty()) retryBuilder.delete(bodyJson.toRequestBody(mediaType)).build() else retryBuilder.delete().build()
-                            else -> retryBuilder.get().build()
-                        }
-
-                        client.newCall(retryRequest).execute().use { retryResponse ->
-                            val retryCode = retryResponse.code
-                            val retryBody = retryResponse.body?.string() ?: ""
-
-                            // The retried endpoint may itself rotate the JWT pair (e.g. a
-                            // token/change call that 401'd) — capture it if present.
-                            extractSgaRotatedTokens(url, retryBody)?.let { (newAccess, newRefresh) ->
+                            if (newAccess.isNotEmpty()) {
                                 onSgaRefreshed?.invoke(newAccess, newRefresh)
                             }
+                        }
 
-                            val headersMap = retryResponse.headers.toMultimap()
-                            val headersJsonObj = JSONObject()
-                            headersMap.forEach { (k, v) ->
-                                headersJsonObj.put(k, JSONArray(v))
+                        // Retry with the newest token: either freshly obtained above or
+                        // already installed by the concurrent refresh.
+                        val freshAccess = sgaAccessTokenProvider()
+                        if (freshAccess.isNotEmpty()) {
+                            val newHeadersObj = if (headersJson.isNotBlank()) JSONObject(headersJson) else JSONObject()
+                            newHeadersObj.put("Authorization", "Bearer $freshAccess")
+
+                            val retryBuilder = Request.Builder().url(url)
+                            val keys = newHeadersObj.keys()
+                            while (keys.hasNext()) {
+                                val k = keys.next()
+                                retryBuilder.addHeader(k, newHeadersObj.getString(k))
                             }
 
-                            return@withContext JSONObject().apply {
-                                put("status", retryCode)
-                                put("isSuccessful", retryResponse.isSuccessful)
-                                put("headers", headersJsonObj)
-                                put("body", retryBody)
-                                put("autoRefreshedToken", true)
-                            }.toString()
+                            val retryRequest = when (method.uppercase()) {
+                                "POST" -> retryBuilder.post(bodyJson.toRequestBody(mediaType)).build()
+                                "PUT" -> retryBuilder.put(bodyJson.toRequestBody(mediaType)).build()
+                                "DELETE" -> if (bodyJson.isNotEmpty()) retryBuilder.delete(bodyJson.toRequestBody(mediaType)).build() else retryBuilder.delete().build()
+                                else -> retryBuilder.get().build()
+                            }
+
+                            client.newCall(retryRequest).execute().use { retryResponse ->
+                                val retryCode = retryResponse.code
+                                val retryBody = retryResponse.body?.string() ?: ""
+
+                                // The retried endpoint may itself rotate the JWT pair (e.g. a
+                                // token/change call that 401'd) — capture it if present.
+                                extractSgaRotatedTokens(url, retryBody)?.let { (rotAccess, rotRefresh) ->
+                                    onSgaRefreshed?.invoke(rotAccess, rotRefresh)
+                                }
+
+                                val headersMap = retryResponse.headers.toMultimap()
+                                val headersJsonObj = JSONObject()
+                                headersMap.forEach { (k, v) ->
+                                    headersJsonObj.put(k, JSONArray(v))
+                                }
+
+                                autoRetryResult = JSONObject().apply {
+                                    put("status", retryCode)
+                                    put("isSuccessful", retryResponse.isSuccessful)
+                                    put("headers", headersJsonObj)
+                                    put("body", retryBody)
+                                    put("autoRefreshedToken", true)
+                                }.toString()
+                            }
                         }
+                    }
+
+                    if (autoRetryResult != null) {
+                        return@withContext autoRetryResult
                     }
                 }
 

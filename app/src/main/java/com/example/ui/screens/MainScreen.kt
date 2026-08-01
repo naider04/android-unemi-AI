@@ -2162,8 +2162,7 @@ fun SettingsDialog(
                                     if (sgaToken.isNotEmpty()) {
                                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                             OutlinedButton(
-                                                onClick = { viewModel.refreshSgaNow() },
-                                                enabled = !sgaValid
+                                                onClick = { viewModel.refreshSgaNow { showSgaDialog = true } }
                                             ) {
                                                 Text(if (sgaValid) "Refresh" else "Reconnect")
                                             }
