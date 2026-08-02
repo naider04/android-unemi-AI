@@ -331,7 +331,13 @@ object GeminiApiClient {
             """.trimIndent() else "No active UNEMI SGA session stored. If user asks for SGA info without logging in, tell them to log in via Configurations or supply credentials."}
             
             CURRENT SGA SESSION CONTEXT (REAL ids from the user's authenticated session — use these exact values for 'perfil_id' in token/change/career and 'periodo_id' in token/change/academic_period; NEVER invent, guess, or hardcode ids):
-            ${buildSgaSessionContext(sgaSessionPayload)}
+            ${buildSgaSessionContext(sgaSessionPayload, sgaAccessToken)}
+            
+            CAREER & PERIOD SWITCHING RULES:
+            - Each profile line above shows a DISTINCT 'perfil_id' — the ids share the same prefix so they look alike, but every line is unique. Only ONE line is marked [ACTIVE].
+            - To switch careers, call token/change/career with the perfil_id of the line whose carrera matches the user's request — NEVER the [ACTIVE] line's own perfil_id (sending the active id changes nothing).
+            - Same rule for periods: send token/change/academic_period with the periodo_id of the requested periodo, never the current one.
+            - After a successful switch the tool result states the new active profile/period (verified by the app) — trust that verified statement over any raw token content in the response.
             
             CRITICAL DIRECTIVE FOR UNEMI SGA API:
             - UNEMI SGA student endpoints are 100% STATELESS REST APIs located at 'https://sga.unemi.edu.ec/api/1.0/jwt/...'.
@@ -895,6 +901,21 @@ object GeminiApiClient {
                 When the user asks about a different career or period than the currently active one, IMMEDIATELY switch via token/change first, then query the data endpoint — the new session is automatically kept for subsequent calls.
                 CRITICAL: SGA student endpoints are 100% STATELESS REST APIs. DO NOT claim that SGA requires WebSockets, cookies, a WebView, or browser activation. Pass 'headersJson': '{"Authorization": "Bearer <access_token>"}' when calling JWT endpoints.
 
+                ACTIVE UNEMI SGA SESSION:
+                ${if (sgaAccessToken.isNotEmpty()) """
+                - SGA Session Status: ${if (sgaSessionValid) "Active" else "Expired (renewal failed)"}
+                - DIRECT EXECUTION RULE: An active SGA session is configured${if (!sgaSessionValid) ", but it is currently expired and could not be renewed automatically" else ""}. The app automatically injects and maintains the Authorization Bearer token and performs silent re-authentication on 401 errors. When calling UNEMI SGA endpoints using 'executeApiEndpoint', pass 'headersJson': '{}' or omit 'headersJson'. If an SGA API call still returns 401/Unauthorized after automatic refresh, inform the user: "Your SGA session expired and couldn't be renewed automatically — please re-authenticate in Configurations." Never invent, fabricate, or "confirm" SGA data unless explicitly returned by an actual API call.
+                """.trimIndent() else "No active UNEMI SGA session stored. If user asks for SGA info without logging in, tell them to log in via Configurations or supply credentials."}
+
+                CURRENT SGA SESSION CONTEXT (REAL ids from the user's authenticated session — use these exact values for 'perfil_id' in token/change/career and 'periodo_id' in token/change/academic_period; NEVER invent, guess, or hardcode ids):
+                ${buildSgaSessionContext(sgaSessionPayload, sgaAccessToken)}
+
+                CAREER & PERIOD SWITCHING RULES:
+                - Each profile line above shows a DISTINCT 'perfil_id' — the ids share the same prefix so they look alike, but every line is unique. Only ONE line is marked [ACTIVE].
+                - To switch careers, call token/change/career with the perfil_id of the line whose carrera matches the user's request — NEVER the [ACTIVE] line's own perfil_id (sending the active id changes nothing).
+                - Same rule for periods: send token/change/academic_period with the periodo_id of the requested periodo, never the current one.
+                - After a successful switch the tool result states the new active profile/period (verified by the app) — trust that verified statement over any raw token content in the response.
+
                 GRADE & STATUS EXTRACTION RULES:
                 - Quiz (Cuestionario):
                   * Check 'completiondata.state' in core_course_get_contents. State 0 = incomplete (Pending/No hecho), State > 0 = complete (Submitted/Graded).
@@ -1256,17 +1277,44 @@ object GeminiApiClient {
     /**
      * Extracts the profile/period/matricula ids from the stored SGA JWT payload so
      * the model always works with the CURRENT user's real ids (never hardcoded).
+     *
+     * Profiles are rendered one per line with an [ACTIVE] marker so the model can
+     * copy the exact perfil_id per carrera — raw JSONArray dumps previously led it
+     * to conflate the (visually similar) ids. If the stored payload is stale and
+     * lacks profile data, the live access token is decoded as a fallback.
      */
-    private fun buildSgaSessionContext(sgaSessionPayload: String): String {
+    private fun buildSgaSessionContext(sgaSessionPayload: String, sgaAccessToken: String = ""): String {
         if (sgaSessionPayload.isBlank()) {
             return "(No SGA session payload stored — user must log in to SGA in Configurations before switching careers or periods.)"
         }
         return try {
-            val json = JSONObject(sgaSessionPayload)
+            var json = JSONObject(sgaSessionPayload)
+            if (!json.has("perfiles") && sgaAccessToken.isNotBlank()) {
+                SgaApiClient.decodeJwtPayload(sgaAccessToken)?.let { json = it }
+            }
             val parts = mutableListOf<String>()
-            json.optJSONObject("perfilprincipal")?.let { parts.add("active_profile: ${it.toString()}") }
-            json.optJSONArray("perfiles")?.let { parts.add("all_profiles (use 'id' as perfil_id): ${it.toString()}") }
-            json.optJSONArray("periodos")?.let { parts.add("all_periods (use 'id' as periodo_id): ${it.toString()}") }
+            val activeId = json.optJSONObject("perfilprincipal")?.optString("id", "").orEmpty()
+
+            json.optJSONArray("perfiles")?.let { arr ->
+                val lines = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val p = arr.optJSONObject(i) ?: continue
+                    val id = p.optString("id", "")
+                    val marker = if (id == activeId) " [ACTIVE]" else ""
+                    lines.add("- perfil_id=$id | carrera=${p.optString("carrera", "")} | tipo=${p.optString("display_clasificacion", "")}$marker")
+                }
+                if (lines.isNotEmpty()) parts.add("ALL PROFILES (perfil_id -> carrera):\n${lines.joinToString("\n")}")
+            }
+
+            json.optJSONArray("periodos")?.let { arr ->
+                val lines = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val p = arr.optJSONObject(i) ?: continue
+                    lines.add("- periodo_id=${p.optString("id", "")} | ${p.optString("nombre_completo", "")}")
+                }
+                if (lines.isNotEmpty()) parts.add("ALL PERIODS (periodo_id -> periodo):\n${lines.joinToString("\n")}")
+            }
+
             json.optJSONObject("periodo")?.let { parts.add("current_period: ${it.toString()}") }
             json.optJSONObject("matricula")?.let { parts.add("matricula: ${it.toString()}") }
             json.optJSONObject("inscripcion")?.let { parts.add("inscripcion: ${it.toString()}") }
@@ -1288,6 +1336,78 @@ object GeminiApiClient {
             val access = json.optString("access", "")
             val refresh = json.optString("refresh", "")
             if (access.isNotEmpty() && refresh.isNotEmpty()) access to refresh else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Builds an app-verified confirmation for token/change/career responses, decoding
+     * the rotated access token to state the new active profile and every available
+     * profile. This replaces the raw {access, refresh} JWT pair the model previously
+     * saw — opaque base64 that it misread as "all profiles have the same id".
+     * Returns null when the body cannot be parsed, so callers fall back to raw.
+     */
+    private fun sgaCareerSwitchConfirmation(body: String): String? {
+        return try {
+            val json = JSONObject(body)
+            val access = json.optString("access", "")
+            if (access.isEmpty()) return null
+            val payload = SgaApiClient.decodeJwtPayload(access) ?: return null
+            val activeId = payload.optJSONObject("perfilprincipal")?.optString("id", "").orEmpty()
+            val profiles = payload.optJSONArray("perfiles")
+            val lines = mutableListOf<String>()
+            var activeCarrera = ""
+            if (profiles != null) {
+                for (i in 0 until profiles.length()) {
+                    val p = profiles.optJSONObject(i) ?: continue
+                    val id = p.optString("id", "")
+                    if (id == activeId) activeCarrera = p.optString("carrera", "")
+                    val marker = if (id == activeId) " [ACTIVE]" else ""
+                    lines.add("- perfil_id=$id | carrera=${p.optString("carrera", "")} | tipo=${p.optString("display_clasificacion", "")}$marker")
+                }
+            }
+            val sb = StringBuilder()
+            sb.append("[APP VERIFIED] Career switch processed. New active profile: $activeCarrera (perfil_id=$activeId).")
+            if (lines.isNotEmpty()) {
+                sb.append("\nALL PROFILES in the new session:\n")
+                sb.append(lines.joinToString("\n"))
+            }
+            sb.toString()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Same idea for token/change/academic_period — confirms the new active period
+     * and lists every available period in the rotated session.
+     */
+    private fun sgaPeriodSwitchConfirmation(body: String): String? {
+        return try {
+            val json = JSONObject(body)
+            val access = json.optString("access", "")
+            if (access.isEmpty()) return null
+            val payload = SgaApiClient.decodeJwtPayload(access) ?: return null
+            val activePeriod = payload.optJSONObject("periodo")
+            val activePeriodId = activePeriod?.optString("id", "").orEmpty()
+            val activePeriodName = activePeriod?.optString("nombre_completo", "").orEmpty()
+            val periods = payload.optJSONArray("periodos")
+            val lines = mutableListOf<String>()
+            if (periods != null) {
+                for (i in 0 until periods.length()) {
+                    val p = periods.optJSONObject(i) ?: continue
+                    val marker = if (p.optString("id", "") == activePeriodId) " [ACTIVE]" else ""
+                    lines.add("- periodo_id=${p.optString("id", "")} | ${p.optString("nombre_completo", "")}$marker")
+                }
+            }
+            val sb = StringBuilder()
+            sb.append("[APP VERIFIED] Academic period switch processed. New active period: $activePeriodName (periodo_id=$activePeriodId).")
+            if (lines.isNotEmpty()) {
+                sb.append("\nALL PERIODS in the new session:\n")
+                sb.append(lines.joinToString("\n"))
+            }
+            sb.toString()
         } catch (e: Exception) {
             null
         }
@@ -1548,6 +1668,11 @@ object GeminiApiClient {
         sgaPassProvider: () -> String = { "" },
         onSgaRefreshed: ((newAccess: String, newRefresh: String) -> Unit)? = null
     ): String = withContext(Dispatchers.IO) {
+        // When a token/change/* (or token/refresh) response rotates the JWT pair, we
+        // replace the opaque base64 body with an app-verified, human-readable summary
+        // so the model never has to "decode" the tokens itself (it misreads them as
+        // identical ids).
+        var sgaSwitchNote: String? = null
         try {
             val builder = Request.Builder().url(url)
 
@@ -1583,6 +1708,63 @@ object GeminiApiClient {
                 }
             }
 
+            // token/change/career & token/change/academic_period: validate the
+            // requested id against the current session's real profiles/periods
+            // BEFORE calling, so a wrong (or no-op) switch fails loudly with the
+            // valid ids instead of silently keeping the old profile.
+            if (url.contains("/token/change/") && method.equals("POST", ignoreCase = true)) {
+                try {
+                    val bodyObj = if (effectiveBodyJson.isNotBlank()) JSONObject(effectiveBodyJson) else JSONObject()
+                    val curAccess = sgaAccessTokenProvider()
+                    val curPayload = if (curAccess.isNotEmpty()) SgaApiClient.decodeJwtPayload(curAccess) else null
+                    if (curPayload != null) {
+                        if (url.contains("/token/change/career")) {
+                            val requested = bodyObj.optString("perfil_id", "")
+                            val valid = mutableListOf<String>()
+                            var found = false
+                            curPayload.optJSONArray("perfiles")?.let { arr ->
+                                for (i in 0 until arr.length()) {
+                                    val p = arr.optJSONObject(i) ?: continue
+                                    val id = p.optString("id", "")
+                                    valid.add("$id | ${p.optString("carrera", "")}")
+                                    if (requested.isNotEmpty() && id == requested) found = true
+                                }
+                            }
+                            if (requested.isNotEmpty() && !found) {
+                                return@withContext JSONObject().apply {
+                                    put("status", 400)
+                                    put("isSuccessful", false)
+                                    put("error", "Career switch rejected by app: perfil_id=$requested does not match any of the user's profiles. Use one of these valid perfil_id values:")
+                                    put("valid_perfil_ids", valid.joinToString("\n"))
+                                }.toString()
+                            }
+                        } else if (url.contains("/token/change/academic_period")) {
+                            val requested = bodyObj.optString("periodo_id", "")
+                            val valid = mutableListOf<String>()
+                            var found = false
+                            curPayload.optJSONArray("periodos")?.let { arr ->
+                                for (i in 0 until arr.length()) {
+                                    val p = arr.optJSONObject(i) ?: continue
+                                    val id = p.optString("id", "")
+                                    valid.add("$id | ${p.optString("nombre_completo", "")}")
+                                    if (requested.isNotEmpty() && id == requested) found = true
+                                }
+                            }
+                            if (requested.isNotEmpty() && !found) {
+                                return@withContext JSONObject().apply {
+                                    put("status", 400)
+                                    put("isSuccessful", false)
+                                    put("error", "Period switch rejected by app: periodo_id=$requested does not match any period of the user. Use one of these valid periodo_id values:")
+                                    put("valid_period_ids", valid.joinToString("\n"))
+                                }.toString()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to validate token/change request", e)
+                }
+            }
+
             val request = when (method.uppercase()) {
                 "GET" -> builder.get().build()
                 "POST" -> {
@@ -1612,6 +1794,12 @@ object GeminiApiClient {
                 extractSgaRotatedTokens(url, body)?.let { (newAccess, newRefresh) ->
                     Log.i(TAG, "SGA session rotated by endpoint: $url — capturing new tokens")
                     onSgaRefreshed?.invoke(newAccess, newRefresh)
+                    sgaSwitchNote = when {
+                        url.contains("/token/change/career") -> sgaCareerSwitchConfirmation(body)
+                        url.contains("/token/change/academic_period") -> sgaPeriodSwitchConfirmation(body)
+                        url.contains("/token/refresh") -> "[APP VERIFIED] SGA access token refreshed — career and period unchanged."
+                        else -> null
+                    }
                 }
 
                 val curRefreshToken = sgaRefreshTokenProvider()
@@ -1702,6 +1890,12 @@ object GeminiApiClient {
                                 // token/change call that 401'd) — capture it if present.
                                 extractSgaRotatedTokens(url, retryBody)?.let { (rotAccess, rotRefresh) ->
                                     onSgaRefreshed?.invoke(rotAccess, rotRefresh)
+                                    sgaSwitchNote = when {
+                                        url.contains("/token/change/career") -> sgaCareerSwitchConfirmation(retryBody)
+                                        url.contains("/token/change/academic_period") -> sgaPeriodSwitchConfirmation(retryBody)
+                                        url.contains("/token/refresh") -> "[APP VERIFIED] SGA access token refreshed — career and period unchanged."
+                                        else -> null
+                                    }
                                 }
 
                                 val headersMap = retryResponse.headers.toMultimap()
@@ -1714,7 +1908,7 @@ object GeminiApiClient {
                                     put("status", retryCode)
                                     put("isSuccessful", retryResponse.isSuccessful)
                                     put("headers", headersJsonObj)
-                                    put("body", summarizeSgaResponse(url, retryBody) ?: retryBody)
+                                    put("body", sgaSwitchNote ?: summarizeSgaResponse(url, retryBody) ?: retryBody)
                                     put("autoRefreshedToken", true)
                                 }.toString()
                             }
@@ -1736,7 +1930,7 @@ object GeminiApiClient {
                     put("status", code)
                     put("isSuccessful", response.isSuccessful)
                     put("headers", headersJsonObj)
-                    put("body", summarizeSgaResponse(url, body) ?: body)
+                    put("body", sgaSwitchNote ?: summarizeSgaResponse(url, body) ?: body)
                 }.toString()
             }
         } catch (e: Exception) {
