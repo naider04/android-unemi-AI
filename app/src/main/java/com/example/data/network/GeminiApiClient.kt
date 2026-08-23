@@ -32,6 +32,41 @@ object GeminiApiClient {
     // Keep per-message history bounded so the prompt stays small and fast to process
     private const val MAX_HISTORY_CHARS_PER_MSG = 1200
 
+    /**
+     * Strips stale or confabulatory SGA session detail out of chat-history messages
+     * before they are re-sent to the model. Old tool results and the model's own
+     * earlier (sometimes wrong) id dumps otherwise poison its reasoning — it once
+     * concluded "all perfil_ids are the same string" from a prior turn. The CURRENT
+     * session context in the system prompt (and the [CURRENT SGA SESSION] note
+     * appended to each tool result) is the only place ids should come from.
+     * Returns "" when nothing usable remains, so callers can skip the message.
+     */
+    private fun sanitizeHistoryForModel(text: String, maxChars: Int): String {
+        val kept = text.split("\n").filterNot { line ->
+            val l = line.trim()
+            l.isEmpty() ||
+                l.length > 400 ||
+                l.contains("perfil_id=", ignoreCase = true) ||
+                l.contains("inscripcion_id=", ignoreCase = true) ||
+                l.contains("matricula_id=", ignoreCase = true) ||
+                l.contains("periodo_id=", ignoreCase = true) ||
+                l.contains("OPPQQRRSS", ignoreCase = true) ||
+                l.contains("CURRENT SGA SESSION", ignoreCase = true) ||
+                l.contains("ALL PROFILES", ignoreCase = true) ||
+                l.contains("ALL PERIODS", ignoreCase = true) ||
+                l.contains("[APP VERIFIED]", ignoreCase = true) ||
+                l.contains("masked", ignoreCase = true) ||
+                l.contains("obfuscat", ignoreCase = true) ||
+                l.contains("aliased", ignoreCase = true) ||
+                l.contains("same string", ignoreCase = true) ||
+                l.contains("same id", ignoreCase = true) ||
+                l.contains("all the same", ignoreCase = true) ||
+                l.contains("identical", ignoreCase = true) ||
+                l.contains("indistinguishable", ignoreCase = true)
+        }.joinToString("\n").trim()
+        return kept.take(maxChars)
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(120, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
@@ -338,7 +373,10 @@ object GeminiApiClient {
             - To switch careers, call token/change/career with the perfil_id of the line whose carrera matches the user's request — NEVER the [ACTIVE] line's own perfil_id (sending the active id changes nothing).
             - Same rule for periods: send token/change/academic_period with the periodo_id of the requested periodo, never the current one.
             - After a successful switch the tool result states the new active profile/period (verified by the app) — trust that verified statement over any raw token content in the response.
-            
+            - VERIFY YOUR SWITCH: if the [APP VERIFIED] switch confirmation names a career/period that is NOT the one the user asked about, do NOT give up — immediately issue another token/change/career (or token/change/academic_period) using the correct perfil_id/periodo_id from the ALL PROFILES/ALL PERIODS list inside that same confirmation, then query the data endpoint. Keep switching until the confirmation names the requested career/period.
+            - IDS FOR DATA ENDPOINTS: alumno/notas/{inscripcion_id}/ needs the INSCRIPCION_ID and alumno/asistencia/{matricula_id} plus general/data need the MATRICULA_ID from the session context above — after switching careers, use the NEW INSCRIPCION_ID / NEW MATRICULA_ID stated in the switch confirmation.
+            - CRITICAL: NEVER reuse inscripcion_id/matricula_id values from OLD conversation history and NEVER invent ids — always take them from the CURRENT session context lines above or the [APP VERIFIED] switch confirmation. If notas returns 'Acceso no permitido', re-check the CURRENT INSCRIPCION_ID (or the NEW ids from the last switch) and retry with that exact id before giving up.
+
             CRITICAL DIRECTIVE FOR UNEMI SGA API:
             - UNEMI SGA student endpoints are 100% STATELESS REST APIs located at 'https://sga.unemi.edu.ec/api/1.0/jwt/...'.
             - DO NOT hallucinate, fabricate, or claim that SGA requires WebSockets, cookies, a WebView, JavaScript execution, or a 'changetoken' link.
@@ -478,10 +516,13 @@ object GeminiApiClient {
                         put("content", adjustedSystemInstructionText)
                     })
                     recentHistory.forEach { msg ->
-                        put(JSONObject().apply {
-                            put("role", if (msg.sender == "user") "user" else "assistant")
-                            put("content", msg.text.take(MAX_HISTORY_CHARS_PER_MSG))
-                        })
+                        val sanitized = sanitizeHistoryForModel(msg.text, MAX_HISTORY_CHARS_PER_MSG)
+                        if (sanitized.isNotEmpty()) {
+                            put(JSONObject().apply {
+                                put("role", if (msg.sender == "user") "user" else "assistant")
+                                put("content", sanitized)
+                            })
+                        }
                     }
                     put(JSONObject().apply {
                         put("role", "user")
@@ -915,6 +956,9 @@ object GeminiApiClient {
                 - To switch careers, call token/change/career with the perfil_id of the line whose carrera matches the user's request — NEVER the [ACTIVE] line's own perfil_id (sending the active id changes nothing).
                 - Same rule for periods: send token/change/academic_period with the periodo_id of the requested periodo, never the current one.
                 - After a successful switch the tool result states the new active profile/period (verified by the app) — trust that verified statement over any raw token content in the response.
+                - VERIFY YOUR SWITCH: if the [APP VERIFIED] switch confirmation names a career/period that is NOT the one the user asked about, do NOT give up — immediately issue another token/change/career (or token/change/academic_period) using the correct perfil_id/periodo_id from the ALL PROFILES/ALL PERIODS list inside that same confirmation, then query the data endpoint. Keep switching until the confirmation names the requested career/period.
+                - IDS FOR DATA ENDPOINTS: alumno/notas/{inscripcion_id}/ needs the INSCRIPCION_ID and alumno/asistencia/{matricula_id} plus general/data need the MATRICULA_ID from the session context above — after switching careers, use the NEW INSCRIPCION_ID / NEW MATRICULA_ID stated in the switch confirmation.
+                - CRITICAL: NEVER reuse inscripcion_id/matricula_id values from OLD conversation history and NEVER invent ids — always take them from the CURRENT session context lines above or the [APP VERIFIED] switch confirmation. If notas returns 'Acceso no permitido', re-check the CURRENT INSCRIPCION_ID (or the NEW ids from the last switch) and retry with that exact id before giving up.
 
                 GRADE & STATUS EXTRACTION RULES:
                 - Quiz (Cuestionario):
@@ -984,12 +1028,15 @@ object GeminiApiClient {
             // Build initial conversation with user's prompt and chat history
             val contentsArray = JSONArray()
             recentHistory.forEach { msg ->
-                contentsArray.put(JSONObject().apply {
-                    put("role", if (msg.sender == "user") "user" else "model")
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply { put("text", msg.text.take(MAX_HISTORY_CHARS_PER_MSG)) })
+                val sanitized = sanitizeHistoryForModel(msg.text, MAX_HISTORY_CHARS_PER_MSG)
+                if (sanitized.isNotEmpty()) {
+                    contentsArray.put(JSONObject().apply {
+                        put("role", if (msg.sender == "user") "user" else "model")
+                        put("parts", JSONArray().apply {
+                            put(JSONObject().apply { put("text", sanitized) })
+                        })
                     })
-                })
+                }
             }
             val userContent = JSONObject().apply {
                 put("role", "user")
@@ -1284,14 +1331,22 @@ object GeminiApiClient {
      * lacks profile data, the live access token is decoded as a fallback.
      */
     private fun buildSgaSessionContext(sgaSessionPayload: String, sgaAccessToken: String = ""): String {
-        if (sgaSessionPayload.isBlank()) {
+        if (sgaSessionPayload.isBlank() && sgaAccessToken.isBlank()) {
             return "(No SGA session payload stored — user must log in to SGA in Configurations before switching careers or periods.)"
         }
         return try {
-            var json = JSONObject(sgaSessionPayload)
-            if (!json.has("perfiles") && sgaAccessToken.isNotBlank()) {
-                SgaApiClient.decodeJwtPayload(sgaAccessToken)?.let { json = it }
+            // The live access token is the authoritative session state (it is what
+            // the API actually authenticates with), so decode it directly when
+            // available — a stale stored payload can otherwise feed outdated
+            // profile/inscripcion ids to the model.
+            var json: JSONObject? = null
+            if (sgaAccessToken.isNotBlank()) {
+                json = SgaApiClient.decodeJwtPayload(sgaAccessToken)
             }
+            if (json == null) {
+                json = try { JSONObject(sgaSessionPayload) } catch (e: Exception) { null }
+            }
+            if (json == null) return sgaSessionPayload.take(2000)
             val parts = mutableListOf<String>()
             val activeId = json.optJSONObject("perfilprincipal")?.optString("id", "").orEmpty()
 
@@ -1316,8 +1371,12 @@ object GeminiApiClient {
             }
 
             json.optJSONObject("periodo")?.let { parts.add("current_period: ${it.toString()}") }
-            json.optJSONObject("matricula")?.let { parts.add("matricula: ${it.toString()}") }
-            json.optJSONObject("inscripcion")?.let { parts.add("inscripcion: ${it.toString()}") }
+            json.optJSONObject("inscripcion")?.let { i ->
+                parts.add("CURRENT INSCRIPCION_ID (use in alumno/notas/{inscripcion_id}/): ${i.optString("id", "")}")
+            }
+            json.optJSONObject("matricula")?.let { m ->
+                parts.add("CURRENT MATRICULA_ID (use in alumno/asistencia/{matricula_id} and general/data with id): ${m.optString("id", "")}")
+            }
             if (parts.isEmpty()) sgaSessionPayload.take(2000) else parts.joinToString("\n")
         } catch (e: Exception) {
             sgaSessionPayload.take(2000)
@@ -1369,6 +1428,11 @@ object GeminiApiClient {
             }
             val sb = StringBuilder()
             sb.append("[APP VERIFIED] Career switch processed. New active profile: $activeCarrera (perfil_id=$activeId).")
+            val newIns = payload.optJSONObject("inscripcion")?.optString("id", "").orEmpty()
+            val newMat = payload.optJSONObject("matricula")?.optString("id", "").orEmpty()
+            if (newIns.isNotEmpty() || newMat.isNotEmpty()) {
+                sb.append(" NEW INSCRIPCION_ID=$newIns | NEW MATRICULA_ID=$newMat — use these now for notas/asistencia/general data.")
+            }
             if (lines.isNotEmpty()) {
                 sb.append("\nALL PROFILES in the new session:\n")
                 sb.append(lines.joinToString("\n"))
@@ -1403,11 +1467,53 @@ object GeminiApiClient {
             }
             val sb = StringBuilder()
             sb.append("[APP VERIFIED] Academic period switch processed. New active period: $activePeriodName (periodo_id=$activePeriodId).")
+            val insId = payload.optJSONObject("inscripcion")?.optString("id", "").orEmpty()
+            val matId = payload.optJSONObject("matricula")?.optString("id", "").orEmpty()
+            if (insId.isNotEmpty() || matId.isNotEmpty()) {
+                sb.append(" INSCRIPCION_ID=$insId | MATRICULA_ID=$matId.")
+            }
             if (lines.isNotEmpty()) {
                 sb.append("\nALL PERIODS in the new session:\n")
                 sb.append(lines.joinToString("\n"))
             }
             sb.toString()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Builds a compact, app-verified snapshot of the CURRENT active SGA session
+     * (decoded from the live access token): active career, perfil_id, and the
+     * inscripcion_id/matricula_id that data endpoints (notas/asistencia/general)
+     * need. Appended to every SGA tool result so the model always sees the
+     * current ids — even several tool-call rounds after a career/period switch,
+     * when the static prompt context is stale. Returns null if no token exists
+     * or it cannot be decoded.
+     */
+    private fun buildSgaSessionStateNote(accessTokenProvider: () -> String): String? {
+        val cur = accessTokenProvider()
+        if (cur.isEmpty()) return null
+        return try {
+            val p = SgaApiClient.decodeJwtPayload(cur) ?: return null
+            val activeId = p.optJSONObject("perfilprincipal")?.optString("id", "").orEmpty()
+            var carrera = ""
+            p.optJSONArray("perfiles")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val prof = arr.optJSONObject(i) ?: continue
+                    if (prof.optString("id", "") == activeId) {
+                        carrera = prof.optString("carrera", "")
+                        break
+                    }
+                }
+            }
+            val ins = p.optJSONObject("inscripcion")?.optString("id", "").orEmpty()
+            val mat = p.optJSONObject("matricula")?.optString("id", "").orEmpty()
+            val periodo = p.optJSONObject("periodo")
+            val periodoId = periodo?.optString("id", "").orEmpty()
+            val periodoName = periodo?.optString("nombre_completo", "").orEmpty()
+            if (activeId.isEmpty() && ins.isEmpty() && mat.isEmpty()) return null
+            "[CURRENT SGA SESSION] active_career=$carrera | perfil_id=$activeId | inscripcion_id=$ins | matricula_id=$mat | periodo=$periodoName ($periodoId)"
         } catch (e: Exception) {
             null
         }
@@ -1908,7 +2014,8 @@ object GeminiApiClient {
                                     put("status", retryCode)
                                     put("isSuccessful", retryResponse.isSuccessful)
                                     put("headers", headersJsonObj)
-                                    put("body", sgaSwitchNote ?: summarizeSgaResponse(url, retryBody) ?: retryBody)
+                                    val retryBodyFinal = sgaSwitchNote ?: summarizeSgaResponse(url, retryBody) ?: retryBody
+                                    put("body", buildSgaSessionStateNote(sgaAccessTokenProvider)?.let { "$it\n$retryBodyFinal" } ?: retryBodyFinal)
                                     put("autoRefreshedToken", true)
                                 }.toString()
                             }
@@ -1930,7 +2037,8 @@ object GeminiApiClient {
                     put("status", code)
                     put("isSuccessful", response.isSuccessful)
                     put("headers", headersJsonObj)
-                    put("body", sgaSwitchNote ?: summarizeSgaResponse(url, body) ?: body)
+                    val bodyFinal = sgaSwitchNote ?: summarizeSgaResponse(url, body) ?: body
+                    put("body", buildSgaSessionStateNote(sgaAccessTokenProvider)?.let { "$it\n$bodyFinal" } ?: bodyFinal)
                 }.toString()
             }
         } catch (e: Exception) {

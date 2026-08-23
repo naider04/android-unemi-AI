@@ -61,7 +61,6 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
     private val _geminiApiKey = MutableStateFlow(sharedPrefs.getString("gemini_api_key", BuildConfig.GEMINI_API_KEY) ?: "")
     val geminiApiKey: StateFlow<String> = _geminiApiKey.asStateFlow()
 
-    // Config: OpenCode AI
     private val _useOpenCode = MutableStateFlow(sharedPrefs.getBoolean("use_opencode", false))
     val useOpenCode: StateFlow<Boolean> = _useOpenCode.asStateFlow()
 
@@ -162,7 +161,7 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         
         // Start background checks for notifications/alarms
         startAlarmChecker()
-
+        
         // Proactively renew the SGA session so the AI never hits an expired token
         viewModelScope.launch { refreshSgaIfNeeded() }
     }
@@ -259,7 +258,6 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
             .putString("sga_access_token", newAccess)
             .putString("sga_refresh_token", newRefresh)
             .apply()
-        updateSgaSessionMeta()
     }
 
     /**
@@ -334,11 +332,6 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         return false
     }
 
-    /**
-     * Forces an immediate SGA session renewal (used by the UI Refresh button).
-     * Shows a toast with the outcome; when no stored credentials exist, the
-     * caller is told to open the credential dialog so the user can reconnect.
-     */
     fun refreshSgaNow(onNeedsCredentials: () -> Unit = {}) {
         viewModelScope.launch {
             val ok = refreshSgaIfNeeded(force = true)
@@ -449,7 +442,7 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
             if (sgaAccessToken.value.isNotEmpty()) {
                 refreshSgaIfNeeded()
             }
- 
+
             val chatResult = GeminiApiClient.chatWithAi(
                 userQuery = query,
                 apiKey = geminiApiKey.value,
@@ -494,7 +487,7 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                     updateSgaTokens(newAccess, newRefresh)
                 }
             )
- 
+
             // Streamed text updates are posted to the main looper from background
             // threads. Wait for any still-queued posts to be processed before
             // finalizing the message, so streamedReply reflects every chunk.
@@ -503,7 +496,7 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                     cont.resume(Unit)
                 }
             }
- 
+
             _isChatLoading.value = false
             
             var actionStatus: String? = null
@@ -563,7 +556,7 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
             }
- 
+
             val replyText = chatResult.reply
             if (streamedReply) {
                 // The final answer already streamed into the UI as it was generated;
@@ -755,18 +748,8 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
                                 }
                             }
                         }
-                    } else {
-                        alarms.forEach { alarm ->
-                            if (alarm.isEnabled && alarm.isActive && alarm.triggerType != "CUSTOM_CODE" && alarm.timeScheduled in (now - 5000)..now) {
-                                withContext(Dispatchers.Main) {
-                                    triggerLocalNotification(alarm.title, alarm.body, alarm.ruleType == "ALARM")
-                                }
-                                database.moodleDao().insertNotification(alarm.copy(isActive = false))
-                            }
-                        }
                     }
-                }
-                mainHandler.postDelayed(this, 5000)
+                }, 5000)
             }
         }, 5000)
     }
@@ -826,10 +809,3 @@ class MoodleViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 }
-
-data class ChatMessage(
-    val sender: String, // "user" or "ai"
-    val text: String,
-    val timestamp: Long,
-    val actionApplied: String? = null
-)

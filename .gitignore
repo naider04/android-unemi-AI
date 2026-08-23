@@ -16,3 +16,8 @@
 local.properties
 .env
 debug.keystore
+
+# Local-only scripts/data containing real credentials & PII
+moodle_probe.py
+sga_probe.py
+materias_raw.json
